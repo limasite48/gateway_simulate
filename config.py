@@ -12,6 +12,9 @@ TOPIC_ZIGBEE_COMMAND = "duk1chvietcong/hcmc_office/command"     # Publish Hex xu
 TOPIC_SERVER_SEND = "duk1chvietcong/hcmc_office/data_send"       # Publish JSON lên Server
 TOPIC_SERVER_RECEIVE = "duk1chvietcong/hcmc_office/data_receive" # Subscribe JSON nhận từ Server
 
+# Cấu hình bảo mật AES-CCM (Giả lập Link Key từ Zigbee 3.0 Install Code)
+AES_KEY = b"HCMC_Office_v2_K"
+
 # Mã hex định danh cho các phân vùng (Zone ID)
 ZONE_CODES = {
     "pantry": 0x01,

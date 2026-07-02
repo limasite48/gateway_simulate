@@ -59,7 +59,6 @@ def on_message(client, userdata, msg):
         
         parsed = parse_uplink_frame(payload_str)
         if not parsed:
-            print(f"[DEBUG ERR] Gói tin lỗi cấu trúc hoặc checksum: {payload_str}", flush=True)
             return
             
         zone_id = parsed["zone_id"]
@@ -130,8 +129,22 @@ mqtt_client.on_message = on_message
 
 def gateway_loop():
     """Luồng phụ cập nhật định kỳ và đẩy tin nhắn Server từ hàng đợi"""
+    last_flush_time = time.time()
     while True:
-        # Nếu có tin nhắn trong hàng đợi gửi Server và mạng kết nối bình thường
+        now = time.time()
+        # 1. Gom tin thường gửi Server (Debounce 3 giây)
+        if now - last_flush_time >= 3.0:
+            last_flush_time = now
+            if gateway.pending_publish:
+                payload = json.dumps(gateway.state_document, ensure_ascii=False)
+                if gateway.network_connected:
+                    gateway.server_publish_queue.append((TOPIC_SERVER_SEND, payload))
+                    gateway.stats["tx_server"] += 1
+                else:
+                    gateway.save_offline_data(gateway.state_document)
+                gateway.pending_publish = False
+
+        # 2. Đẩy tin nhắn từ hàng đợi ra MQTT broker (nếu kết nối mạng)
         if gateway.network_connected:
             while gateway.server_publish_queue:
                 topic, payload = gateway.server_publish_queue.pop(0)
@@ -171,9 +184,9 @@ def display_status():
         print(f"  * File log offline hiện tại: {gateway.offline_file_path} ({size} bytes)")
     
     # Hiển thị bảng Device Shadow của 12 zone
-    print(f"+-----------------+---------+--------+-------------+-------+-------+-------------------------+")
-    print(f"|        Phân vùng| Nhiệt độ|   Độ ẩm|     Ánh sáng|   Khói|    Đèn|             Điều hòa AHU|")
-    print(f"+-----------------+---------+--------+-------------+-------+-------+-------------------------+")
+    print(f"+-----------------+----------+--------+-------------+-------+-------+-------------------------+")
+    print(f"|       Phân vùng | Nhiệt độ |  Độ ẩm |    Ánh sáng |  Khói |   Đèn |            Điều hòa AHU |")
+    print(f"+-----------------+----------+--------+-------------+-------+-------+-------------------------+")
     for zone in ZONES:
         data = gateway.state_document["zones"][zone]
         temp_str = f"{data['temp']:.1f}°C" if data["temp"] is not None else "N/A"
@@ -190,8 +203,8 @@ def display_status():
         else:
             ahu_str = "N/A"
             
-        print(f"| {zone:<15} | {temp_str:>8} | {humid_str:>6} | {light_str:>10} | {smoke_str:<5} | {lamp_str:<5} | {ahu_str:<23} |")
-    print(f"+-----------------+---------+--------+-------------+-------+-------+-------------------------+")
+        print(f"| {zone:<15} | {temp_str:>8} | {humid_str:>6} |  {light_str:>10} | {smoke_str:<5} | {lamp_str:<5} | {ahu_str:<23} |")
+    print(f"+-----------------+----------+--------+-------------+-------+-------+-------------------------+")
     
     # Bảng Cửa đi
     print("\n--- TRẠNG THÁI CỬA ĐI ---")

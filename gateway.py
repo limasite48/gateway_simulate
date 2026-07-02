@@ -31,28 +31,35 @@ class GatewayEngine:
             "windows": {}
         }
         
-        # Khởi tạo trạng thái ban đầu trống cho các Zone
+        # Khởi tạo trạng thái mặc định cho các Zone để đồng bộ và tránh N/A
         for zone in ZONES:
             self.state_document["zones"][zone] = {
-                "temp": None,
-                "humid": None,
-                "smoke": None,
-                "light_intensity": None,
-                "light": None,
-                "ahu": None
+                "temp": 25.0,
+                "humid": 60.0,
+                "smoke": False,
+                "light_intensity": 50,
+                "light": {"status": "OFF"},
+                "ahu": {
+                    "status": "OFF",
+                    "fan_speed": 1,
+                    "temp_set": 25.0
+                }
             }
             
-        # Khởi tạo trạng thái ban đầu trống cho các cửa đi (door_01 -> door_05)
+        # Khởi tạo trạng thái mặc định cho các cửa đi (mặc định đóng)
         for i in range(1, 6):
             self.state_document["doors"][f"door_0{i}"] = {
-                "status": None
+                "status": "closed"
             }
             
-        # Khởi tạo trạng thái ban đầu trống cho các cửa sổ & rèm (wd_01 -> wd_06)
+        # Khởi tạo trạng thái mặc định cho các cửa sổ & rèm (mặc định đóng, rèm che 100%)
         for i in range(1, 7):
             self.state_document["windows"][f"wd_0{i}"] = {
-                "status": None,
-                "curtain": None
+                "status": "closed",
+                "curtain": {
+                    "status": "closed",
+                    "percentage_cover": 100
+                }
             }
             
         # Lưu trữ giá trị gần nhất được gửi lên Server để kiểm tra ngưỡng lọc
@@ -67,6 +74,9 @@ class GatewayEngine:
             
         # Hàng đợi các gói JSON cần gửi lên Server (dành cho client kết nối đẩy đi)
         self.server_publish_queue = []
+        
+        # Cờ đánh dấu có cập nhật dữ liệu thường đang chờ gửi lên Server (Gom tin/Debounce)
+        self.pending_publish = False
         
         # Đường dẫn file log lưu trữ ngoại tuyến
         self.offline_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "offline_telemetry.json")
@@ -164,22 +174,18 @@ class GatewayEngine:
 
         # 2. Xử lý gửi dữ liệu lên Server (nếu vượt qua bộ lọc)
         if should_publish:
-            # Biên tập gói tin JSON tổng hợp
-            payload = json.dumps(self.state_document, ensure_ascii=False)
-            
-            if self.network_connected:
-                # Nếu mạng hoạt động
-                if is_smoke_alert:
-                    # Gửi liên tiếp 3 lần đối với cảnh báo khói để tránh mất tin
+            if is_smoke_alert:
+                # Cảnh báo cháy: Gửi ngay lập tức 3 lần để tránh mất tin, không trì hoãn
+                payload = json.dumps(self.state_document, ensure_ascii=False)
+                if self.network_connected:
                     for _ in range(3):
                         self.server_publish_queue.append((TOPIC_SERVER_SEND, payload))
                         self.stats["tx_server"] += 1
                 else:
-                    self.server_publish_queue.append((TOPIC_SERVER_SEND, payload))
-                    self.stats["tx_server"] += 1
+                    self.save_offline_data(self.state_document)
             else:
-                # Nếu mất kết nối mạng, lưu offline
-                self.save_offline_data(self.state_document)
+                # Dữ liệu thường: Đánh dấu cần gửi (sẽ được gom và gửi sau ở gateway_loop)
+                self.pending_publish = True
                 
             return True
             
