@@ -1,0 +1,9 @@
+[project]
+name = "gateway-simulate"
+version = "0.1.0"
+description = "IoT Gateway Simulator for HCMC Office"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "paho-mqtt>=2.1.0",
+]
