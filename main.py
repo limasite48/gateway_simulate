@@ -136,12 +136,13 @@ def gateway_loop():
         if now - last_flush_time >= 3.0:
             last_flush_time = now
             if gateway.pending_publish:
-                payload = json.dumps(gateway.state_document, ensure_ascii=False)
+                delta_payload = gateway.get_delta_payload()
+                payload = json.dumps(delta_payload, ensure_ascii=False)
                 if gateway.network_connected:
                     gateway.server_publish_queue.append((TOPIC_SERVER_SEND, payload))
                     gateway.stats["tx_server"] += 1
                 else:
-                    gateway.save_offline_data(gateway.state_document)
+                    gateway.save_offline_data(delta_payload)
                 gateway.pending_publish = False
 
         # 2. Đẩy tin nhắn từ hàng đợi ra MQTT broker (nếu kết nối mạng)
@@ -169,7 +170,7 @@ def print_help():
 def display_status():
     """Hiển thị trạng thái Gateway, chỉ số thống kê và dữ liệu lưu trữ hiện tại"""
     print(f"\n--- TRẠNG THÁI HOẠT ĐỘNG GATEWAY ---")
-    conn_status = "ĐANG KẾT NỐI (ON)" if gateway.network_connected else "MẤT KẾT NỐI (OFF - NGOẠI TUYẾN)"
+    conn_status = "ĐANG KẾT NỐI (BẬT)" if gateway.network_connected else "MẤT KẾT NỐI (TẮT - NGOẠI TUYẾN)"
     print(f"Kết nối Server: {conn_status}")
     print(f"Thống kê gói tin:")
     print(f"  - Nhận từ Zigbee (Uplink): {gateway.stats['rx_zigbee']}")
@@ -189,13 +190,14 @@ def display_status():
     print(f"+-----------------+----------+--------+-------------+-------+-------+-------------------------+")
     for zone in ZONES:
         data = gateway.state_document["zones"][zone]
-        temp_str = f"{data['temp']:.1f}°C" if data["temp"] is not None else "N/A"
-        humid_str = f"{data['humid']:.1f}%" if data["humid"] is not None else "N/A"
-        light_str = f"{data['light_intensity']} lux" if data["light_intensity"] is not None else "N/A"
+        temp_val = data["temp"]
+        humid_val = data["humid"]
+        light_val = data["light_intensity"]
+        
         smoke_str = "CÓ KHÓI" if data["smoke"] is True else ("Không" if data["smoke"] is False else "N/A")
         
         lamp_val = data["light"]
-        lamp_str = lamp_val.get("status", "N/A") if isinstance(lamp_val, dict) else "N/A"
+        light_str = lamp_val.get("status", "N/A") if isinstance(lamp_val, dict) else "N/A"
         
         ahu_val = data["ahu"]
         if isinstance(ahu_val, dict):
@@ -203,7 +205,11 @@ def display_status():
         else:
             ahu_str = "N/A"
             
-        print(f"| {zone:<15} | {temp_str:>8} | {humid_str:>6} |  {light_str:>10} | {smoke_str:<5} | {lamp_str:<5} | {ahu_str:<23} |")
+        temp_part = f"{temp_val:>5.1f}°C" if temp_val is not None else "     N/A"
+        humid_part = f"{humid_val:>5.1f}%" if humid_val is not None else "   N/A"
+        light_part = f"{light_val:>7} lux" if light_val is not None else "   N/A lux"
+            
+        print(f"| {zone:<15} |  {temp_part} | {humid_part} | {light_part} | {smoke_str:<5} |  {light_str:<5}| {ahu_str:<23} |")
     print(f"+-----------------+----------+--------+-------------+-------+-------+-------------------------+")
     
     # Bảng Cửa đi
@@ -266,7 +272,7 @@ def console_loop():
             if len(parts) > 1 and parts[1].lower() in ["on", "off"]:
                 state = (parts[1].lower() == "on")
                 gateway.network_connected = state
-                print(f"Đã cập nhật trạng thái mạng: {'KẾT NỐI (ON)' if state else 'MẤT KẾT NỐI (OFF)'}")
+                print(f"Đã cập nhật trạng thái mạng: {'KẾT NỐI (BẬT)' if state else 'MẤT KẾT NỐI (TẮT)'}")
                 
                 if state:
                     # Gửi bù tin nhắn lưu offline khi mạng phục hồi

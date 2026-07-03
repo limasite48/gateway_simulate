@@ -2,6 +2,19 @@ import struct
 from Crypto.Cipher import AES
 from config import TYPE_CODES, CODE_TO_TYPE, ZONE_CODES, CODE_TO_ZONE, AES_KEY
 
+# Đảm bảo AES_KEY có độ dài hợp lệ (16, 24 hoặc 32 bytes) bằng cách căn phải ljust
+_key_len = len(AES_KEY)
+if _key_len in [16, 24, 32]:
+    VALID_AES_KEY = AES_KEY
+elif _key_len < 16:
+    VALID_AES_KEY = AES_KEY.ljust(16, b'\x00')
+elif _key_len < 24:
+    VALID_AES_KEY = AES_KEY.ljust(24, b'\x00')
+elif _key_len < 32:
+    VALID_AES_KEY = AES_KEY.ljust(32, b'\x00')
+else:
+    VALID_AES_KEY = AES_KEY[:32]
+
 tx_sequence_counter = 0
 
 def get_next_sequence_number() -> int:
@@ -14,14 +27,14 @@ def aes_ccm_encrypt(zone_id: int, type_code: int, seq_num: int, plaintext: bytes
     """Mã hóa AES-CCM và trả về (ciphertext, tag)"""
     # Tạo Nonce 13-Byte: [Zone ID (1B)][Type Code (1B)][Seq (4B)] + 7 Bytes 0x00
     nonce = struct.pack(">BBI", zone_id, type_code, seq_num) + b"\x00" * 7
-    cipher = AES.new(AES_KEY, AES.MODE_CCM, nonce=nonce, mac_len=4)
+    cipher = AES.new(VALID_AES_KEY, AES.MODE_CCM, nonce=nonce, mac_len=4)
     ciphertext, tag = cipher.encrypt_and_digest(plaintext)
     return ciphertext, tag
 
 def aes_ccm_decrypt(zone_id: int, type_code: int, seq_num: int, ciphertext: bytes, tag: bytes) -> bytes:
     """Giải mã AES-CCM và xác thực tính toàn vẹn (trả về plaintext hoặc None)"""
     nonce = struct.pack(">BBI", zone_id, type_code, seq_num) + b"\x00" * 7
-    cipher = AES.new(AES_KEY, AES.MODE_CCM, nonce=nonce, mac_len=4)
+    cipher = AES.new(VALID_AES_KEY, AES.MODE_CCM, nonce=nonce, mac_len=4)
     try:
         return cipher.decrypt_and_verify(ciphertext, tag)
     except ValueError:
@@ -102,16 +115,16 @@ def decode_uplink_payload(type_code: int, payload: bytes):
             
         elif type_code == TYPE_CODES["mc38"]:
             is_open = struct.unpack(">B", payload)[0] == 1
-            return {"status": "open" if is_open else "closed"}
+            return {"status": "MỞ" if is_open else "ĐÓNG"}
             
         elif type_code == TYPE_CODES["light"]:
             active = struct.unpack(">B", payload)[0] == 1
-            return {"status": "ON" if active else "OFF"}
+            return {"status": "BẬT" if active else "TẮT"}
             
         elif type_code == TYPE_CODES["ahu"]:
             active_val, fan_speed, temp_set_val = struct.unpack(">BBh", payload)
             return {
-                "status": "ON" if active_val == 1 else "OFF",
+                "status": "BẬT" if active_val == 1 else "TẮT",
                 "fan_speed": fan_speed,
                 "temp_set": temp_set_val / 10.0
             }
@@ -119,7 +132,7 @@ def decode_uplink_payload(type_code: int, payload: bytes):
         elif type_code == TYPE_CODES["curtain"]:
             percentage_cover = struct.unpack(">B", payload)[0]
             return {
-                "status": "closed" if percentage_cover > 80 else ("open" if percentage_cover < 20 else "half"),
+                "status": "ĐÓNG" if percentage_cover > 80 else ("MỞ" if percentage_cover < 20 else "LỬNG"),
                 "percentage_cover": percentage_cover
             }
             
