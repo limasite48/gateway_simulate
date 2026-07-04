@@ -27,6 +27,7 @@ from protocol import (
     encode_downlink_command, wrap_downlink_frame
 )
 from gateway import GatewayEngine
+import backend_adapter as ba
 
 # Khởi tạo engine của Gateway
 gateway = GatewayEngine()
@@ -46,7 +47,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(TOPIC_SERVER_RECEIVE)
     
     print(f"[MQTT] Đã subscribe kênh Zigbee Telemetry: {TOPIC_ZIGBEE_TELEMETRY}", flush=True)
-    print(f"[MQTT] Đã subscribe kênh Server Receive:  {TOPIC_SERVER_RECEIVE}\n", flush=True)
+    print(f"[MQTT] Đã subscribe kênh Server Receive:  {TOPIC_SERVER_RECEIVE}", flush=True)
+
+    # Subscribe kênh lệnh của backend thật (iot/command/{device_id})
+    client.subscribe(ba.BACKEND_COMMAND_SUB)
+    print(f"[MQTT] Đã subscribe kênh lệnh Backend:    {ba.BACKEND_COMMAND_SUB}\n", flush=True)
     connected_event.set()
 
 def on_message(client, userdata, msg):
@@ -73,7 +78,16 @@ def on_message(client, userdata, msg):
             
         # Đẩy dữ liệu vào Engine để xử lý (lọc ngưỡng, cập nhật bảng trạng thái)
         was_published = gateway.process_device_update(zone_id, type_code, decoded_data)
-        
+
+        # Chuyển tiếp lên BACKEND THẬT: sau khi đã giải mã AES-CCM, dịch sang JSON chuẩn backend.
+        # Chỉ office_1/meeting với dht22 (temp/humid) & mq2 (smoke) — khớp thiết bị seed ở backend.
+        zone_name_fwd = CODE_TO_ZONE.get(zone_id)
+        type_name_fwd = CODE_TO_TYPE.get(type_code)
+        if zone_name_fwd and type_name_fwd:
+            fwd = ba.build_telemetry(zone_name_fwd, type_name_fwd, decoded_data)
+            if fwd:
+                client.publish(fwd[0], fwd[1])
+
         if log_packets:
             zone_name = CODE_TO_ZONE.get(zone_id, f"0x{zone_id:02X}")
             type_name = CODE_TO_TYPE.get(type_code, f"0x{type_code:02X}")
@@ -121,6 +135,63 @@ def on_message(client, userdata, msg):
             
         except Exception as e:
             print(f"[SERVER ERR] Gói tin JSON từ Server bị lỗi cú pháp: {e}")
+
+    # 3. Nhận lệnh từ BACKEND THẬT (iot/command/{device_id})
+    elif msg.topic.startswith("iot/command/"):
+        handle_backend_command(client, msg)
+
+
+def handle_backend_command(client, msg):
+    """Lệnh backend -> mã hóa AES-CCM downlink cho sensor -> ack (RECEIVED/SUCCESS) về backend."""
+    global log_packets
+    device_id = msg.topic.split("/")[-1]
+    try:
+        cmd_json = json.loads(msg.payload.decode("utf-8", errors="ignore").strip())
+    except Exception as e:
+        print(f"[BACKEND ERR] Lệnh JSON từ backend bị lỗi: {e}", flush=True)
+        return
+
+    command_id = cmd_json.get("command_id")
+    parameters = cmd_json.get("parameters", {})
+
+    emu_target, emu_device, emu_cmd = ba.translate_command(device_id, parameters)
+    if emu_device:
+        zone_code = ZONE_CODES.get(emu_target)
+        type_code = TYPE_CODES.get(emu_device)
+        raw_payload = encode_downlink_command(type_code, emu_cmd)
+        if zone_code is not None and type_code is not None and raw_payload is not None:
+            # Dùng lại đúng đường mã hóa AES-CCM downlink của gateway
+            hex_command = wrap_downlink_frame(zone_code, type_code, raw_payload)
+            client.publish(TOPIC_ZIGBEE_COMMAND, hex_command)
+            gateway.stats["tx_zigbee"] += 1
+            if log_packets:
+                print(f"[BACKEND CMD] {device_id} -> {emu_target}.{emu_device} {emu_cmd} | đã mã hóa & gửi Hex downlink", flush=True)
+    else:
+        print(f"[BACKEND CMD] {device_id}: sim không có thiết bị vật lý tương ứng — chỉ ack.", flush=True)
+
+    # Ack về backend: RECEIVED ngay, SUCCESS sau ~0.6s (giả lập thời gian thực thi)
+    ack_t = ba.ack_topic(device_id)
+    client.publish(ack_t, json.dumps({"command_id": command_id, "device_id": device_id, "status": "RECEIVED"}))
+
+    def _send_success():
+        time.sleep(0.6)
+        client.publish(ack_t, json.dumps({
+            "command_id": command_id, "device_id": device_id,
+            "status": "SUCCESS", "executed_at": ba._now_iso(),
+        }))
+
+    threading.Thread(target=_send_success, daemon=True).start()
+
+
+def heartbeat_loop():
+    """Gửi heartbeat định kỳ (30s) cho 12 thiết bị ACTIVE để backend đánh dấu ONLINE."""
+    while True:
+        if gateway.network_connected:
+            for device_id in ba.HEARTBEAT_DEVICES:
+                topic, payload = ba.build_heartbeat(device_id)
+                mqtt_client.publish(topic, payload)
+        time.sleep(30)
+
 
 # Khởi tạo MQTT Client sử dụng callback API version 2
 mqtt_client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
@@ -317,9 +388,18 @@ if __name__ == "__main__":
     t = threading.Thread(target=gateway_loop, daemon=True)
     t.start()
     
-    # Chạy giao diện dòng lệnh console chính
+    # Chạy luồng heartbeat gửi lên backend (đánh dấu thiết bị ONLINE)
+    hb = threading.Thread(target=heartbeat_loop, daemon=True)
+    hb.start()
+
+    # Chạy giao diện dòng lệnh console chính (hoặc chạy nền nếu không có console)
     try:
-        console_loop()
+        if sys.stdin is not None and sys.stdin.isatty():
+            console_loop()
+        else:
+            print("[HEADLESS] Không có console tương tác — gateway chạy nền.", flush=True)
+            while True:
+                time.sleep(1)
     except Exception as e:
         print(f"Lỗi vòng lặp console: {e}")
     finally:

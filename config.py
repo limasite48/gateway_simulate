@@ -1,6 +1,8 @@
 # Cấu hình cho bộ giả lập IoT Gateway
 
-MQTT_BROKER = "broker.emqx.io"
+# Broker cục bộ dùng chung với sensor & backend (đổi từ broker.emqx.io sang localhost
+# để gateway vừa nhận hex AES-CCM từ sensor, vừa nói chuyện với backend qua Mosquitto localhost:1883)
+MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 
 # Các topic MQTT dùng cho Gateway
