@@ -38,6 +38,29 @@ log_packets = False
 # Event đồng bộ hóa kết nối mạng trước khi chạy gateway
 connected_event = threading.Event()
 
+# Bộ đệm lưu trữ các lệnh đang chờ xác thực phản hồi trạng thái từ thiết bị (Handshake ACK)
+pending_commands = {}
+pending_commands_lock = threading.Lock()
+
+def is_state_matching(device_type, emu_cmd, decoded_data):
+    """Kiểm tra dữ liệu phản hồi thô từ thiết bị có trùng khớp với trạng thái mong muốn không"""
+    if device_type == "light":
+        expected_status = "BẬT" if emu_cmd.get("active") else "TẮT"
+        return decoded_data.get("status") == expected_status
+    elif device_type == "ahu":
+        expected_status = "BẬT" if emu_cmd.get("active") else "TẮT"
+        if decoded_data.get("status") != expected_status:
+            return False
+        if emu_cmd.get("fan_speed") is not None and decoded_data.get("fan_speed") != emu_cmd.get("fan_speed"):
+            return False
+        if emu_cmd.get("temp_set") is not None and abs(decoded_data.get("temp_set", 0.0) - emu_cmd.get("temp_set")) > 0.1:
+            return False
+        return True
+    elif device_type == "curtain":
+        expected_pct = emu_cmd.get("percentage_cover")
+        return decoded_data.get("percentage_cover") == expected_pct
+    return True
+
 def on_connect(client, userdata, flags, rc, properties=None):
     """Callback khi kết nối thành công tới broker"""
     print(f"\n[MQTT] Gateway đã kết nối thành công tới Broker: {MQTT_BROKER}", flush=True)
@@ -78,6 +101,15 @@ def on_message(client, userdata, msg):
             
         # Đẩy dữ liệu vào Engine để xử lý (lọc ngưỡng, cập nhật bảng trạng thái)
         was_published = gateway.process_device_update(zone_id, type_code, decoded_data)
+
+        # Kiểm tra các lệnh đang chờ xác thực phản hồi từ thiết bị (Handshake ACK)
+        type_name_check = CODE_TO_TYPE.get(type_code)
+        if type_name_check:
+            with pending_commands_lock:
+                cmds = pending_commands.get((zone_id, type_code), [])
+                for cmd in cmds:
+                    if is_state_matching(type_name_check, cmd["emu_cmd"], decoded_data):
+                        cmd["event"].set()
 
         # Chuyển tiếp lên BACKEND THẬT: sau khi đã giải mã AES-CCM, dịch sang JSON chuẩn backend.
         # Chỉ office_1/meeting với dht22 (temp/humid) & mq2 (smoke) — khớp thiết bị seed ở backend.
@@ -142,7 +174,7 @@ def on_message(client, userdata, msg):
 
 
 def handle_backend_command(client, msg):
-    """Lệnh backend -> mã hóa AES-CCM downlink cho sensor -> ack (RECEIVED/SUCCESS) về backend."""
+    """Lệnh backend -> mã hóa AES-CCM downlink cho sensor -> ack (RECEIVED/SUCCESS) về backend sau khi xác thực phản hồi thô."""
     global log_packets
     device_id = msg.topic.split("/")[-1]
     try:
@@ -155,6 +187,11 @@ def handle_backend_command(client, msg):
     parameters = cmd_json.get("parameters", {})
 
     emu_target, emu_device, emu_cmd = ba.translate_command(device_id, parameters)
+    ack_t = ba.ack_topic(device_id)
+
+    # Gửi RECEIVED ngay lập tức để backend biết gateway đã nhận lệnh
+    client.publish(ack_t, json.dumps({"command_id": command_id, "device_id": device_id, "status": "RECEIVED"}))
+
     if emu_device:
         zone_code = ZONE_CODES.get(emu_target)
         type_code = TYPE_CODES.get(emu_device)
@@ -166,22 +203,93 @@ def handle_backend_command(client, msg):
             gateway.stats["tx_zigbee"] += 1
             if log_packets:
                 print(f"[BACKEND CMD] {device_id} -> {emu_target}.{emu_device} {emu_cmd} | đã mã hóa & gửi Hex downlink", flush=True)
+
+            # Luồng chờ phản hồi từ thiết bị (Handshake ACK)
+            def _wait_for_ack(cmd_id, dev_id, z_code, t_code, cmd_params, timeout=4.0):
+                event = threading.Event()
+                with pending_commands_lock:
+                    if (z_code, t_code) not in pending_commands:
+                        pending_commands[(z_code, t_code)] = []
+                    pending_commands[(z_code, t_code)].append({
+                        "command_id": cmd_id,
+                        "emu_cmd": cmd_params,
+                        "event": event
+                    })
+                
+                # Đợi tối đa 4 giây để thiết bị phản hồi
+                success = event.wait(timeout=timeout)
+                
+                # Gỡ bỏ lệnh ra khỏi danh sách pending
+                with pending_commands_lock:
+                    if (z_code, t_code) in pending_commands:
+                        pending_commands[(z_code, t_code)] = [c for c in pending_commands[(z_code, t_code)] if c["command_id"] != cmd_id]
+                
+                if success:
+                    client.publish(ack_t, json.dumps({
+                        "command_id": cmd_id,
+                        "device_id": dev_id,
+                        "status": "SUCCESS",
+                        "executed_at": ba._now_iso(),
+                    }))
+                    if log_packets:
+                        print(f"[BACKEND ACK] Lệnh {cmd_id} cho {dev_id} THÀNH CÔNG (Xác thực phản hồi trạng thái từ thiết bị)", flush=True)
+                else:
+                    client.publish(ack_t, json.dumps({
+                        "command_id": cmd_id,
+                        "device_id": dev_id,
+                        "status": "FAILED",
+                        "error": "Device response timeout or disconnected",
+                        "executed_at": ba._now_iso(),
+                    }))
+                    if log_packets:
+                        print(f"[BACKEND ACK] Lệnh {cmd_id} cho {dev_id} THẤT BẠI (Hết thời gian phản hồi từ thiết bị)", flush=True)
+            
+            threading.Thread(target=_wait_for_ack, args=(command_id, device_id, zone_code, type_code, emu_cmd), daemon=True).start()
     else:
+        # Nếu thiết bị không được mô phỏng vật lý, phản hồi SUCCESS lập tức
         print(f"[BACKEND CMD] {device_id}: sim không có thiết bị vật lý tương ứng — chỉ ack.", flush=True)
+        def _send_immediate_success():
+            time.sleep(0.1)
+            client.publish(ack_t, json.dumps({
+                "command_id": command_id,
+                "device_id": device_id,
+                "status": "SUCCESS",
+                "executed_at": ba._now_iso(),
+            }))
+        threading.Thread(target=_send_immediate_success, daemon=True).start()
 
-    # Ack về backend: RECEIVED ngay, SUCCESS sau ~0.6s (giả lập thời gian thực thi)
-    ack_t = ba.ack_topic(device_id)
-    client.publish(ack_t, json.dumps({"command_id": command_id, "device_id": device_id, "status": "RECEIVED"}))
 
-    def _send_success():
-        time.sleep(0.6)
-        client.publish(ack_t, json.dumps({
-            "command_id": command_id, "device_id": device_id,
-            "status": "SUCCESS", "executed_at": ba._now_iso(),
-        }))
-
-    threading.Thread(target=_send_success, daemon=True).start()
-
+def polling_loop():
+    """Luồng phụ thực hiện quét vòng (Polling) các cảm biến"""
+    # Đợi kết nối MQTT thành công trước khi quét
+    connected_event.wait()
+    
+    sensor_types = ["dht22", "mq2", "lm393"]
+    
+    while True:
+        start_time = time.time()
+        
+        # Quét tuần tự 12 zone, mỗi zone quét 3 cảm biến
+        for zone in ZONES:
+            zone_code = ZONE_CODES[zone]
+            for s_type in sensor_types:
+                type_code = TYPE_CODES[s_type]
+                
+                # Payload lệnh poll: 1 byte 0x01
+                raw_payload = b"\x01"
+                hex_command = wrap_downlink_frame(zone_code, type_code, raw_payload)
+                
+                # Publish lệnh poll xuống mạng Zigbee giả lập
+                mqtt_client.publish(TOPIC_ZIGBEE_COMMAND, hex_command)
+                gateway.stats["tx_zigbee"] += 1
+                
+                # Giãn cách 100ms để tránh nghẽn
+                time.sleep(0.1)
+                
+        # Một lượt quét 36 cảm biến mất 3.6 giây. Nghỉ nốt phần còn lại của chu kỳ 30s.
+        elapsed = time.time() - start_time
+        sleep_time = max(0.1, 30.0 - elapsed)
+        time.sleep(sleep_time)
 
 def heartbeat_loop():
     """Gửi heartbeat định kỳ (30s) cho 12 thiết bị ACTIVE để backend đánh dấu ONLINE."""
@@ -391,6 +499,10 @@ if __name__ == "__main__":
     # Chạy luồng heartbeat gửi lên backend (đánh dấu thiết bị ONLINE)
     hb = threading.Thread(target=heartbeat_loop, daemon=True)
     hb.start()
+    
+    # Chạy luồng quét vòng (polling) các cảm biến
+    pl = threading.Thread(target=polling_loop, daemon=True)
+    pl.start()
 
     # Chạy giao diện dòng lệnh console chính (hoặc chạy nền nếu không có console)
     try:

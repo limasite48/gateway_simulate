@@ -64,12 +64,20 @@ class GatewayEngine:
             
         # Lưu trữ giá trị gần nhất được gửi lên Server để kiểm tra ngưỡng lọc
         self.last_sent_values = {}
+        # Lưu trữ mốc thời gian thực gửi thành công gần nhất (để ép gửi Heartbeat sau 5 phút chống trôi)
+        self.last_sent_time = {}
         for zone in ZONES:
             self.last_sent_values[zone] = {
                 "temp": None,
                 "humid": None,
                 "light_intensity": None,
                 "smoke": None
+            }
+            self.last_sent_time[zone] = {
+                "temp": 0.0,
+                "humid": 0.0,
+                "light_intensity": 0.0,
+                "smoke": 0.0
             }
             
         # Hàng đợi các gói JSON cần gửi lên Server (dành cho client kết nối đẩy đi)
@@ -133,24 +141,33 @@ class GatewayEngine:
             zone_data = self.state_document["zones"][zone_name]
             last_sent = self.last_sent_values[zone_name]
             
+            current_time = time.time()
             if type_name == "dht22":
                 temp = decoded_data["temp"]
                 humid = decoded_data["humid"]
                 zone_data["temp"] = temp
                 zone_data["humid"] = humid
                 
-                # Kiểm tra lọc nhiệt độ
-                if last_sent["temp"] is None or abs(temp - last_sent["temp"]) >= TEMP_THRESHOLD:
+                # Kiểm tra lọc nhiệt độ (hoặc cưỡng bức gửi sau 5 phút chống trôi)
+                last_t = self.last_sent_time[zone_name]["temp"]
+                is_temp_timeout = (current_time - last_t >= 300.0)
+                
+                if last_sent["temp"] is None or abs(temp - last_sent["temp"]) >= TEMP_THRESHOLD or is_temp_timeout:
                     should_publish = True
                     last_sent["temp"] = temp
+                    self.last_sent_time[zone_name]["temp"] = current_time
                     if zone_name not in self.pending_delta["zones"]:
                         self.pending_delta["zones"][zone_name] = {}
                     self.pending_delta["zones"][zone_name]["temp"] = temp
                     
-                # Kiểm tra lọc độ ẩm
-                if last_sent["humid"] is None or abs(humid - last_sent["humid"]) >= HUMID_THRESHOLD:
+                # Kiểm tra lọc độ ẩm (hoặc cưỡng bức gửi sau 5 phút chống trôi)
+                last_h = self.last_sent_time[zone_name]["humid"]
+                is_humid_timeout = (current_time - last_h >= 300.0)
+                
+                if last_sent["humid"] is None or abs(humid - last_sent["humid"]) >= HUMID_THRESHOLD or is_humid_timeout:
                     should_publish = True
                     last_sent["humid"] = humid
+                    self.last_sent_time[zone_name]["humid"] = current_time
                     if zone_name not in self.pending_delta["zones"]:
                         self.pending_delta["zones"][zone_name] = {}
                     self.pending_delta["zones"][zone_name]["humid"] = humid
@@ -162,10 +179,14 @@ class GatewayEngine:
                 light = decoded_data["light_intensity"]
                 zone_data["light_intensity"] = light
                 
-                # Kiểm tra lọc ánh sáng
-                if last_sent["light_intensity"] is None or abs(light - last_sent["light_intensity"]) >= LIGHT_THRESHOLD:
+                # Kiểm tra lọc ánh sáng (hoặc cưỡng bức gửi sau 5 phút chống trôi)
+                last_l = self.last_sent_time[zone_name]["light_intensity"]
+                is_light_timeout = (current_time - last_l >= 300.0)
+                
+                if last_sent["light_intensity"] is None or abs(light - last_sent["light_intensity"]) >= LIGHT_THRESHOLD or is_light_timeout:
                     should_publish = True
                     last_sent["light_intensity"] = light
+                    self.last_sent_time[zone_name]["light_intensity"] = current_time
                     if zone_name not in self.pending_delta["zones"]:
                         self.pending_delta["zones"][zone_name] = {}
                     self.pending_delta["zones"][zone_name]["light_intensity"] = light
@@ -176,11 +197,17 @@ class GatewayEngine:
                 smoke = decoded_data["smoke"]
                 zone_data["smoke"] = smoke
                 
-                # Kiểm tra thay đổi trạng thái báo khói (Ưu tiên cao nhất)
-                if last_sent["smoke"] != smoke:
+                # Kiểm tra thay đổi báo khói (hoặc cưỡng bức gửi sau 5 phút chống trôi)
+                last_s = self.last_sent_time[zone_name]["smoke"]
+                is_smoke_timeout = (current_time - last_s >= 300.0)
+                
+                if last_sent["smoke"] != smoke or is_smoke_timeout:
                     should_publish = True
-                    is_smoke_alert = True
+                    # Báo cháy khẩn cấp chỉ kích hoạt khi chuyển từ không khói -> có khói
+                    if last_sent["smoke"] != smoke and smoke:
+                        is_smoke_alert = True
                     last_sent["smoke"] = smoke
+                    self.last_sent_time[zone_name]["smoke"] = current_time
                     if zone_name not in self.pending_delta["zones"]:
                         self.pending_delta["zones"][zone_name] = {}
                     self.pending_delta["zones"][zone_name]["smoke"] = smoke

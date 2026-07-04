@@ -171,6 +171,11 @@ def encode_downlink_command(type_code: int, params: dict):
             percentage_cover = int(params.get("percentage_cover", 0))
             return struct.pack(">B", percentage_cover)
             
+        elif type_code in [TYPE_CODES["dht22"], TYPE_CODES["mq2"], TYPE_CODES["lm393"]]:
+            # Lệnh poll: {"poll": True}
+            is_poll = 1 if params.get("poll") else 0
+            return struct.pack(">B", is_poll)
+            
     except Exception:
         pass
     return None
